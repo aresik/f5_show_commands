@@ -1,0 +1,7 @@
+# F5 LTM Inventory File
+# One hostname or IP per line
+# Lines starting with '#' are comments and will be ignored
+#
+10.0.1.10
+10.0.1.11
+10.0.1.12
