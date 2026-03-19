@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+f5_virtual_servers.py
+
+Connects to F5 LTM devices via a jump server and extracts virtual server
+information using Netmiko and multithreading.
+
+Usage:
+    python f5_virtual_servers.py [--inventory inventory.txt] [--output output.csv]
+                                  [--threads 10] [--jump-user USER] [--jump-key PATH]
+
+Requirements:
+    pip install netmiko paramiko
+"""
+
+import argparse
+import csv
+import getpass
+import json
+import os
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import paramiko
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
+
+# ---------------------------------------------------------------------------
+# Configuration – override via CLI args or environment variables
+# ---------------------------------------------------------------------------
+JUMP_HOST = os.environ.get("JUMP_HOST", "jumpbox.server.com")
+JUMP_PORT = int(os.environ.get("JUMP_PORT", 22))
+JUMP_USER = os.environ.get("JUMP_USER", "")
+JUMP_PASSWORD = os.environ.get("JUMP_PASSWORD", "")
+JUMP_KEY_FILE = os.environ.get("JUMP_KEY_FILE", "")  # path to private key
+
+F5_PORT = int(os.environ.get("F5_PORT", 22))
+DEFAULT_THREADS = 10
+COMMAND_TIMEOUT = 60  # seconds
+
+
+# ---------------------------------------------------------------------------
+# Jump-server channel helper
+# ---------------------------------------------------------------------------
+
+def _build_jump_client(jump_host, jump_port, jump_user, jump_password, jump_key_file):
+    """Return an authenticated paramiko SSHClient connected to the jump server."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    connect_kwargs = {
+        "hostname": jump_host,
+        "port": jump_port,
+        "username": jump_user,
+        "timeout": 30,
+        "allow_agent": True,
+        "look_for_keys": True,
+    }
+
+    if jump_key_file:
+        connect_kwargs["key_filename"] = jump_key_file
+    elif jump_password:
+        connect_kwargs["password"] = jump_password
+
+    client.connect(**connect_kwargs)
+    return client
+
+
+def _open_channel(jump_client, target_host, target_port):
+    """Open a direct-tcpip channel through an established jump-server client."""
+    transport = jump_client.get_transport()
+    dest_addr = (target_host, target_port)
+    src_addr = ("127.0.0.1", 0)
+    channel = transport.open_channel("direct-tcpip", dest_addr, src_addr)
+    return channel
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_virtual_servers(raw_output):
+    """
+    Parse `tmsh list ltm virtual` output into a list of dicts.
+
+    Each dict contains:
+        name, destination, ip, port, pool, ip_protocol, state, enabled
+    """
+    virtual_servers = []
+    current = None
+
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+
+        # Detect start of a new virtual-server block
+        if re.match(r"^ltm virtual\s+\S+", stripped):
+            if current is not None:
+                virtual_servers.append(current)
+            vs_name = re.sub(r"\s*\{.*", "", stripped.replace("ltm virtual ", "")).strip()
+            current = {
+                "name": vs_name,
+                "destination": "",
+                "ip": "",
+                "port": "",
+                "pool": "",
+                "ip_protocol": "",
+                "state": "",
+                "enabled": "",
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if stripped.startswith("destination "):
+            dest = stripped.split("destination ", 1)[1].strip()
+            current["destination"] = dest
+            # Parse IP and port from formats like 10.0.0.1:80 or /Common/10.0.0.1:80
+            match = re.search(r"([\d.]+):(\d+)$", dest)
+            if match:
+                current["ip"] = match.group(1)
+                current["port"] = match.group(2)
+
+        elif stripped.startswith("pool "):
+            current["pool"] = stripped.split("pool ", 1)[1].strip()
+
+        elif stripped.startswith("ip-protocol "):
+            current["ip_protocol"] = stripped.split("ip-protocol ", 1)[1].strip()
+
+        elif stripped.startswith("enabled-vlans"):
+            pass  # skip sub-block header
+
+        elif stripped == "enabled":
+            current["enabled"] = "yes"
+
+        elif stripped == "disabled":
+            current["enabled"] = "no"
+
+    if current is not None:
+        virtual_servers.append(current)
+
+    return virtual_servers
+
+
+# ---------------------------------------------------------------------------
+# Per-device worker
+# ---------------------------------------------------------------------------
+
+def collect_virtual_servers(host, username, password, jump_config):
+    """
+    Connect to a single F5 LTM device through the jump server and return
+    a result dict with virtual server details.
+
+    Parameters
+    ----------
+    host       : str  – target F5 hostname or IP
+    username   : str  – F5 username
+    password   : str  – F5 password
+    jump_config : dict – keys: host, port, user, password, key_file
+
+    Returns
+    -------
+    dict with keys: host, virtual_servers (list), raw_output (str), error (str|None)
+    """
+    result = {
+        "host": host,
+        "virtual_servers": [],
+        "raw_output": "",
+        "error": None,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    jump_client = None
+    net_connect = None
+
+    try:
+        # 1. Establish jump-server connection
+        jump_client = _build_jump_client(
+            jump_config["host"],
+            jump_config["port"],
+            jump_config["user"],
+            jump_config["password"],
+            jump_config["key_file"],
+        )
+
+        # 2. Open a proxy channel to the target F5
+        channel = _open_channel(jump_client, host, F5_PORT)
+
+        # 3. Connect to F5 via Netmiko using the proxy socket
+        device_params = {
+            "device_type": "f5_ltm",
+            "host": host,
+            "port": F5_PORT,
+            "username": username,
+            "password": password,
+            "sock": channel,
+            "timeout": COMMAND_TIMEOUT,
+            "session_timeout": COMMAND_TIMEOUT,
+            "conn_timeout": 30,
+            "banner_timeout": 30,
+            "auth_timeout": 30,
+            "global_delay_factor": 2,
+        }
+
+        net_connect = ConnectHandler(**device_params)
+
+        # 4. Run TMSH command
+        raw = net_connect.send_command(
+            "tmsh list ltm virtual",
+            read_timeout=COMMAND_TIMEOUT,
+        )
+        result["raw_output"] = raw
+        result["virtual_servers"] = _parse_virtual_servers(raw)
+
+    except NetMikoAuthenticationException as exc:
+        result["error"] = f"Authentication failed: {exc}"
+    except NetMikoTimeoutException as exc:
+        result["error"] = f"Connection timed out: {exc}"
+    except paramiko.AuthenticationException as exc:
+        result["error"] = f"Jump server authentication failed: {exc}"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            if net_connect:
+                net_connect.disconnect()
+        except Exception:
+            pass
+        try:
+            if jump_client:
+                jump_client.close()
+        except Exception:
+            pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Inventory loader
+# ---------------------------------------------------------------------------
+
+def load_inventory(path):
+    """
+    Load hostnames/IPs from an inventory file – one entry per line.
+    Lines starting with '#' or blank lines are ignored.
+    """
+    hosts = []
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line:
+                print(f"[WARN] inventory line {lineno} skipped (empty): {raw!r}")
+                continue
+            hosts.append(line)
+    return hosts
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def _print_results(results):
+    """Pretty-print results to stdout."""
+    for r in results:
+        host = r["host"]
+        ts = r["timestamp"]
+        if r["error"]:
+            print(f"\n[ERROR] {host} ({ts}): {r['error']}")
+        else:
+            vss = r["virtual_servers"]
+            print(f"\n[OK] {host} ({ts}) – {len(vss)} virtual server(s) found")
+            if vss:
+                header = f"  {'Name':<40} {'Destination':<22} {'Pool':<30} {'Proto':<6} {'Enabled'}"
+                print(header)
+                print("  " + "-" * (len(header) - 2))
+                for vs in vss:
+                    print(
+                        f"  {vs['name']:<40} {vs['destination']:<22} "
+                        f"{vs['pool']:<30} {vs['ip_protocol']:<6} {vs['enabled']}"
+                    )
+            else:
+                print("  (no virtual servers configured)")
+
+
+def _write_csv(results, output_path):
+    """Write virtual server data to a CSV file."""
+    fieldnames = [
+        "host",
+        "timestamp",
+        "vs_name",
+        "destination",
+        "ip",
+        "port",
+        "pool",
+        "ip_protocol",
+        "enabled",
+        "error",
+    ]
+    with open(output_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            if r["error"]:
+                writer.writerow(
+                    {
+                        "host": r["host"],
+                        "timestamp": r["timestamp"],
+                        "error": r["error"],
+                    }
+                )
+            elif not r["virtual_servers"]:
+                writer.writerow({"host": r["host"], "timestamp": r["timestamp"]})
+            else:
+                for vs in r["virtual_servers"]:
+                    writer.writerow(
+                        {
+                            "host": r["host"],
+                            "timestamp": r["timestamp"],
+                            "vs_name": vs["name"],
+                            "destination": vs["destination"],
+                            "ip": vs["ip"],
+                            "port": vs["port"],
+                            "pool": vs["pool"],
+                            "ip_protocol": vs["ip_protocol"],
+                            "enabled": vs["enabled"],
+                            "error": "",
+                        }
+                    )
+    print(f"\nResults written to: {output_path}")
+
+
+def _write_json(results, output_path):
+    """Write full results (including raw TMSH output) to a JSON file."""
+    with open(output_path, "w") as fh:
+        json.dump(results, fh, indent=2)
+    print(f"JSON results written to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Extract F5 LTM virtual servers via a jump server using Netmiko."
+    )
+    parser.add_argument(
+        "--inventory", "-i",
+        default="inventory.txt",
+        help="Path to inventory file (default: inventory.txt)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="",
+        help="Output CSV file path (default: f5_vs_<timestamp>.csv)",
+    )
+    parser.add_argument(
+        "--json-output", "-j",
+        default="",
+        help="Also write full JSON output to this path",
+    )
+    parser.add_argument(
+        "--threads", "-t",
+        type=int,
+        default=DEFAULT_THREADS,
+        help=f"Maximum concurrent threads (default: {DEFAULT_THREADS})",
+    )
+    parser.add_argument(
+        "--jump-host",
+        default=JUMP_HOST,
+        help=f"Jump server hostname (default: {JUMP_HOST})",
+    )
+    parser.add_argument(
+        "--jump-port",
+        type=int,
+        default=JUMP_PORT,
+        help=f"Jump server SSH port (default: {JUMP_PORT})",
+    )
+    parser.add_argument(
+        "--jump-user",
+        default=JUMP_USER,
+        help="Jump server username (or set JUMP_USER env var)",
+    )
+    parser.add_argument(
+        "--jump-key",
+        default=JUMP_KEY_FILE,
+        help="Path to SSH private key for jump server (or set JUMP_KEY_FILE env var)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = _parse_args()
+
+    # ---- Inventory --------------------------------------------------------
+    if not os.path.isfile(args.inventory):
+        print(f"[ERROR] Inventory file not found: {args.inventory}")
+        sys.exit(1)
+
+    hosts = load_inventory(args.inventory)
+    if not hosts:
+        print("[ERROR] No hosts found in inventory.")
+        sys.exit(1)
+
+    print(f"Loaded {len(hosts)} host(s) from {args.inventory}")
+
+    # ---- Jump server credentials ------------------------------------------
+    jump_user = args.jump_user
+    if not jump_user:
+        jump_user = input(f"Jump server ({args.jump_host}) username: ").strip()
+
+    jump_password = ""
+    if not args.jump_key:
+        jump_password_env = os.environ.get("JUMP_PASSWORD", "")
+        if jump_password_env:
+            jump_password = jump_password_env
+        else:
+            jump_password = getpass.getpass(
+                f"Jump server ({args.jump_host}) password (leave blank to use SSH key/agent): "
+            )
+
+    jump_config = {
+        "host": args.jump_host,
+        "port": args.jump_port,
+        "user": jump_user,
+        "password": jump_password,
+        "key_file": args.jump_key,
+    }
+
+    # ---- F5 credentials (prompted once, used for all devices) ---------------
+    f5_username = input("F5 username: ").strip()
+    f5_password = getpass.getpass("F5 password: ")
+
+    # ---- Output path ------------------------------------------------------
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_csv = args.output or f"f5_vs_{ts_str}.csv"
+
+    # ---- Multithreaded collection -----------------------------------------
+    results = []
+    total = len(hosts)
+    completed = 0
+
+    print(
+        f"\nConnecting to {total} device(s) via {args.jump_host} "
+        f"using up to {args.threads} thread(s)...\n"
+    )
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        future_to_host = {
+            executor.submit(collect_virtual_servers, host, f5_username, f5_password, jump_config): host
+            for host in hosts
+        }
+
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "host": host,
+                    "virtual_servers": [],
+                    "raw_output": "",
+                    "error": f"Unhandled exception: {exc}",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+
+            results.append(result)
+            completed += 1
+
+            # Progress indicator
+            status = "ERROR" if result["error"] else f"{len(result['virtual_servers'])} VS"
+            print(f"  [{completed}/{total}] {host} → {status}")
+
+    # ---- Output -----------------------------------------------------------
+    _print_results(results)
+    _write_csv(results, output_csv)
+
+    if args.json_output:
+        _write_json(results, args.json_output)
+
+    # ---- Summary ----------------------------------------------------------
+    errors = [r for r in results if r["error"]]
+    ok = [r for r in results if not r["error"]]
+    total_vs = sum(len(r["virtual_servers"]) for r in ok)
+
+    print(f"\n{'='*60}")
+    print(f"Summary: {len(ok)}/{total} devices OK  |  {len(errors)} errors  |  {total_vs} virtual servers total")
+    print(f"{'='*60}")
+
+    if errors:
+        print("\nFailed devices:")
+        for r in errors:
+            print(f"  {r['host']}: {r['error']}")
+
+    sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    main()
