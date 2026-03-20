@@ -57,6 +57,7 @@ def _build_jump_client(jump_host, jump_port, jump_user, jump_password, jump_key_
         "timeout": 30,
         "allow_agent": True,
         "look_for_keys": True,
+        "banner_timeout": 200,
     }
 
     if jump_key_file:
@@ -69,11 +70,27 @@ def _build_jump_client(jump_host, jump_port, jump_user, jump_password, jump_key_
 
 
 def _open_channel(jump_client, target_host, target_port):
-    """Open a direct-tcpip channel through an established jump-server client."""
+    """
+    Open a proxy channel to target_host:target_port through the jump server.
+
+    Tries direct-tcpip first (fastest). If the jump server blocks it with
+    'administratively prohibited' (PermitOpen restriction), falls back to
+    running `nc` via an exec channel, which bypasses PermitOpen rules.
+    """
     transport = jump_client.get_transport()
-    dest_addr = (target_host, target_port)
-    src_addr = ("127.0.0.1", 0)
-    channel = transport.open_channel("direct-tcpip", dest_addr, src_addr)
+
+    # Attempt 1: direct-tcpip
+    try:
+        dest_addr = (target_host, target_port)
+        src_addr = ("127.0.0.1", 0)
+        channel = transport.open_channel("direct-tcpip", dest_addr, src_addr)
+        return channel
+    except paramiko.ChannelException:
+        pass  # fall through to nc fallback
+
+    # Attempt 2: exec channel running netcat on the jump server
+    channel = transport.open_session()
+    channel.exec_command(f"nc -w 30 {target_host} {target_port}")
     return channel
 
 
@@ -201,11 +218,13 @@ def collect_virtual_servers(host, username, password, jump_config):
             "username": username,
             "password": password,
             "sock": channel,
+            "use_keys": False,
+            "allow_agent": False,
             "timeout": COMMAND_TIMEOUT,
             "session_timeout": COMMAND_TIMEOUT,
-            "conn_timeout": 30,
-            "banner_timeout": 30,
-            "auth_timeout": 30,
+            "conn_timeout": 60,
+            "banner_timeout": 200,
+            "auth_timeout": 60,
             "global_delay_factor": 2,
         }
 
