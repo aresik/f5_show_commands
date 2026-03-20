@@ -177,6 +177,7 @@ def collect_virtual_servers(host, username, password, jump_config):
 
     try:
         # 1. Establish jump-server connection
+        print(f"[{host}] Connecting to jump server {jump_config['host']}...")
         jump_client = _build_jump_client(
             jump_config["host"],
             jump_config["port"],
@@ -184,11 +185,15 @@ def collect_virtual_servers(host, username, password, jump_config):
             jump_config["password"],
             jump_config["key_file"],
         )
+        print(f"[{host}] Connected to jump server {jump_config['host']}")
 
         # 2. Open a proxy channel to the target F5
+        print(f"[{host}] Opening proxy channel to {host}:{F5_PORT}...")
         channel = _open_channel(jump_client, host, F5_PORT)
+        print(f"[{host}] Proxy channel established to {host}")
 
         # 3. Connect to F5 via Netmiko using the proxy socket
+        print(f"[{host}] Connecting to F5 LTM...")
         device_params = {
             "device_type": "f5_ltm",
             "host": host,
@@ -205,6 +210,7 @@ def collect_virtual_servers(host, username, password, jump_config):
         }
 
         net_connect = ConnectHandler(**device_params)
+        print(f"[{host}] Connected to F5 LTM — running 'tmsh list ltm virtual'...")
 
         # 4. Run TMSH command
         raw = net_connect.send_command(
@@ -408,32 +414,17 @@ def main():
 
     print(f"Loaded {len(hosts)} host(s) from {args.inventory}")
 
-    # ---- Jump server credentials ------------------------------------------
-    jump_user = args.jump_user
-    if not jump_user:
-        jump_user = input(f"Jump server ({args.jump_host}) username: ").strip()
-
-    jump_password = ""
-    if not args.jump_key:
-        jump_password_env = os.environ.get("JUMP_PASSWORD", "")
-        if jump_password_env:
-            jump_password = jump_password_env
-        else:
-            jump_password = getpass.getpass(
-                f"Jump server ({args.jump_host}) password (leave blank to use SSH key/agent): "
-            )
+    # ---- Credentials (shared by jump server and all F5 devices) -------------
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
 
     jump_config = {
         "host": args.jump_host,
         "port": args.jump_port,
-        "user": jump_user,
-        "password": jump_password,
+        "user": username,
+        "password": password,
         "key_file": args.jump_key,
     }
-
-    # ---- F5 credentials (prompted once, used for all devices) ---------------
-    f5_username = input("F5 username: ").strip()
-    f5_password = getpass.getpass("F5 password: ")
 
     # ---- Output path ------------------------------------------------------
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -451,7 +442,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_host = {
-            executor.submit(collect_virtual_servers, host, f5_username, f5_password, jump_config): host
+            executor.submit(collect_virtual_servers, host, username, password, jump_config): host
             for host in hosts
         }
 
