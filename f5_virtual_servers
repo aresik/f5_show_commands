@@ -54,16 +54,16 @@ def _build_jump_client(jump_host, jump_port, jump_user, jump_password, jump_key_
         "hostname": jump_host,
         "port": jump_port,
         "username": jump_user,
+        "password": jump_password,
         "timeout": 30,
-        "allow_agent": True,
-        "look_for_keys": True,
+        "allow_agent": False,
+        "look_for_keys": False,
         "banner_timeout": 200,
     }
 
     if jump_key_file:
         connect_kwargs["key_filename"] = jump_key_file
-    elif jump_password:
-        connect_kwargs["password"] = jump_password
+        connect_kwargs["look_for_keys"] = True
 
     client.connect(**connect_kwargs)
     return client
@@ -90,7 +90,9 @@ def _open_channel(jump_client, target_host, target_port):
 
     # Attempt 2: exec channel running netcat on the jump server
     channel = transport.open_session()
-    channel.exec_command(f"nc -w 30 {target_host} {target_port}")
+    channel.set_combine_stderr(True)   # prevent nc stderr from blocking reads
+    channel.settimeout(200)            # match banner_timeout so reads don't expire early
+    channel.exec_command(f"nc -w 60 {target_host} {target_port}")
     return channel
 
 
@@ -161,6 +163,74 @@ def _parse_virtual_servers(raw_output):
     return virtual_servers
 
 
+def _parse_ssl_certs(raw_output):
+    """
+    Parse `tmsh list sys crypto cert` output into a list of dicts.
+
+    Each dict contains:
+        name, subject, issuer, expiration_string, expiration_date,
+        days_until_expiry, subject_alternative_name, key_type,
+        serial_number, sha1_fingerprint
+    """
+    certs = []
+    current = None
+
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+
+        if re.match(r"^sys (crypto cert|file ssl-cert)\s+\S+", stripped):
+            if current is not None:
+                certs.append(current)
+            name = re.sub(r"\s*\{.*", "", re.sub(r"^sys (crypto cert|file ssl-cert)\s+", "", stripped)).strip()
+            current = {
+                "name": name,
+                "subject": "",
+                "issuer": "",
+                "expiration_string": "",
+                "expiration_date": "",
+                "days_until_expiry": "",
+                "subject_alternative_name": "",
+                "key_type": "",
+                "serial_number": "",
+                "sha1_fingerprint": "",
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if stripped.startswith("subject "):
+            current["subject"] = stripped.split("subject ", 1)[1].strip().strip('"')
+        elif stripped.startswith("issuer "):
+            current["issuer"] = stripped.split("issuer ", 1)[1].strip().strip('"')
+        elif stripped.startswith("expiration-string "):
+            current["expiration_string"] = stripped.split("expiration-string ", 1)[1].strip().strip('"')
+        elif stripped.startswith("expiration-date "):
+            ts = stripped.split("expiration-date ", 1)[1].strip()
+            current["expiration_date"] = ts
+            try:
+                from datetime import timezone
+                exp_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                now_dt = datetime.now(tz=timezone.utc)
+                current["days_until_expiry"] = (exp_dt - now_dt).days
+            except Exception:
+                pass
+        elif stripped.startswith("subject-alternative-name "):
+            san = stripped.split("subject-alternative-name ", 1)[1].strip()
+            current["subject_alternative_name"] = "" if san == "none" else san
+        elif stripped.startswith("key-type "):
+            current["key_type"] = stripped.split("key-type ", 1)[1].strip()
+        elif stripped.startswith("serial-number "):
+            current["serial_number"] = stripped.split("serial-number ", 1)[1].strip()
+        elif stripped.startswith("sha1-fingerprint "):
+            current["sha1_fingerprint"] = stripped.split("sha1-fingerprint ", 1)[1].strip()
+
+    if current is not None:
+        certs.append(current)
+
+    return certs
+
+
 # ---------------------------------------------------------------------------
 # Per-device worker
 # ---------------------------------------------------------------------------
@@ -184,7 +254,9 @@ def collect_virtual_servers(host, username, password, jump_config):
     result = {
         "host": host,
         "virtual_servers": [],
+        "ssl_certs": [],
         "raw_output": "",
+        "raw_certs_output": "",
         "error": None,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
@@ -231,13 +303,22 @@ def collect_virtual_servers(host, username, password, jump_config):
         net_connect = ConnectHandler(**device_params)
         print(f"[{host}] Connected to F5 LTM — running 'tmsh list ltm virtual'...")
 
-        # 4. Run TMSH command
+        # 4. Collect virtual servers
         raw = net_connect.send_command(
             "tmsh list ltm virtual",
             read_timeout=COMMAND_TIMEOUT,
         )
         result["raw_output"] = raw
         result["virtual_servers"] = _parse_virtual_servers(raw)
+
+        # 5. Collect SSL certificates
+        print(f"[{host}] Running 'tmsh list sys crypto cert'...")
+        raw_certs = net_connect.send_command(
+            "tmsh list sys crypto cert",
+            read_timeout=COMMAND_TIMEOUT,
+        )
+        result["raw_certs_output"] = raw_certs
+        result["ssl_certs"] = _parse_ssl_certs(raw_certs)
 
     except NetMikoAuthenticationException as exc:
         result["error"] = f"Authentication failed: {exc}"
@@ -295,20 +376,46 @@ def _print_results(results):
         ts = r["timestamp"]
         if r["error"]:
             print(f"\n[ERROR] {host} ({ts}): {r['error']}")
+            continue
+
+        # Virtual servers
+        vss = r["virtual_servers"]
+        print(f"\n[OK] {host} ({ts}) – {len(vss)} virtual server(s) found")
+        if vss:
+            header = f"  {'Name':<40} {'Destination':<22} {'Pool':<30} {'Proto':<6} {'Enabled'}"
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+            for vs in vss:
+                print(
+                    f"  {vs['name']:<40} {vs['destination']:<22} "
+                    f"{vs['pool']:<30} {vs['ip_protocol']:<6} {vs['enabled']}"
+                )
         else:
-            vss = r["virtual_servers"]
-            print(f"\n[OK] {host} ({ts}) – {len(vss)} virtual server(s) found")
-            if vss:
-                header = f"  {'Name':<40} {'Destination':<22} {'Pool':<30} {'Proto':<6} {'Enabled'}"
-                print(header)
-                print("  " + "-" * (len(header) - 2))
-                for vs in vss:
-                    print(
-                        f"  {vs['name']:<40} {vs['destination']:<22} "
-                        f"{vs['pool']:<30} {vs['ip_protocol']:<6} {vs['enabled']}"
-                    )
-            else:
-                print("  (no virtual servers configured)")
+            print("  (no virtual servers configured)")
+
+        # SSL certificates
+        certs = r.get("ssl_certs", [])
+        print(f"\n  SSL Certificates: {len(certs)} found")
+        if certs:
+            cert_header = f"  {'Name':<45} {'Subject':<40} {'Expiry':<28} {'Days Left':>9}"
+            print(cert_header)
+            print("  " + "-" * (len(cert_header) - 2))
+            for c in certs:
+                days = c["days_until_expiry"]
+                if isinstance(days, int):
+                    days_str = f"{days:>9}"
+                    if days < 0:
+                        days_str = f"{'EXPIRED':>9}"
+                    elif days <= 30:
+                        days_str = f"{'⚠ ' + str(days):>9}"
+                else:
+                    days_str = f"{'?':>9}"
+                print(
+                    f"  {c['name']:<45} {c['subject'][:39]:<40} "
+                    f"{c['expiration_string']:<28} {days_str}"
+                )
+        else:
+            print("  (no SSL certificates found)")
 
 
 def _write_csv(results, output_path):
@@ -358,6 +465,53 @@ def _write_csv(results, output_path):
     print(f"\nResults written to: {output_path}")
 
 
+def _write_certs_csv(results, output_path):
+    """Write SSL certificate data to a CSV file."""
+    fieldnames = [
+        "host",
+        "timestamp",
+        "cert_name",
+        "subject",
+        "issuer",
+        "expiration_string",
+        "days_until_expiry",
+        "subject_alternative_name",
+        "key_type",
+        "serial_number",
+        "sha1_fingerprint",
+        "error",
+    ]
+    with open(output_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            if r["error"]:
+                writer.writerow({
+                    "host": r["host"],
+                    "timestamp": r["timestamp"],
+                    "error": r["error"],
+                })
+            elif not r.get("ssl_certs"):
+                writer.writerow({"host": r["host"], "timestamp": r["timestamp"]})
+            else:
+                for c in r["ssl_certs"]:
+                    writer.writerow({
+                        "host": r["host"],
+                        "timestamp": r["timestamp"],
+                        "cert_name": c["name"],
+                        "subject": c["subject"],
+                        "issuer": c["issuer"],
+                        "expiration_string": c["expiration_string"],
+                        "days_until_expiry": c["days_until_expiry"],
+                        "subject_alternative_name": c["subject_alternative_name"],
+                        "key_type": c["key_type"],
+                        "serial_number": c["serial_number"],
+                        "sha1_fingerprint": c["sha1_fingerprint"],
+                        "error": "",
+                    })
+    print(f"SSL cert results written to: {output_path}")
+
+
 def _write_json(results, output_path):
     """Write full results (including raw TMSH output) to a JSON file."""
     with open(output_path, "w") as fh:
@@ -387,6 +541,11 @@ def _parse_args():
         "--json-output", "-j",
         default="",
         help="Also write full JSON output to this path",
+    )
+    parser.add_argument(
+        "--cert-output", "-c",
+        default="",
+        help="Output CSV file path for SSL certs (default: f5_certs_<timestamp>.csv)",
     )
     parser.add_argument(
         "--threads", "-t",
@@ -445,9 +604,10 @@ def main():
         "key_file": args.jump_key,
     }
 
-    # ---- Output path ------------------------------------------------------
+    # ---- Output paths -----------------------------------------------------
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = args.output or f"f5_vs_{ts_str}.csv"
+    output_csv   = args.output      or f"f5_vs_{ts_str}.csv"
+    output_certs = args.cert_output or f"f5_certs_{ts_str}.csv"
 
     # ---- Multithreaded collection -----------------------------------------
     results = []
@@ -488,6 +648,7 @@ def main():
     # ---- Output -----------------------------------------------------------
     _print_results(results)
     _write_csv(results, output_csv)
+    _write_certs_csv(results, output_certs)
 
     if args.json_output:
         _write_json(results, args.json_output)
@@ -495,10 +656,16 @@ def main():
     # ---- Summary ----------------------------------------------------------
     errors = [r for r in results if r["error"]]
     ok = [r for r in results if not r["error"]]
-    total_vs = sum(len(r["virtual_servers"]) for r in ok)
+    total_vs    = sum(len(r["virtual_servers"]) for r in ok)
+    total_certs = sum(len(r.get("ssl_certs", [])) for r in ok)
+    expiring    = sum(
+        1 for r in ok for c in r.get("ssl_certs", [])
+        if isinstance(c["days_until_expiry"], int) and c["days_until_expiry"] <= 30
+    )
 
     print(f"\n{'='*60}")
-    print(f"Summary: {len(ok)}/{total} devices OK  |  {len(errors)} errors  |  {total_vs} virtual servers total")
+    print(f"Summary: {len(ok)}/{total} devices OK  |  {len(errors)} errors")
+    print(f"         {total_vs} virtual servers  |  {total_certs} SSL certs  |  {expiring} expiring within 30 days")
     print(f"{'='*60}")
 
     if errors:
