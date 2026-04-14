@@ -166,12 +166,9 @@ def _parse_virtual_servers(raw_output):
 def _parse_ssl_certs(raw_output):
     """
     Parse `list sys file ssl-cert all-properties` output into a list of dicts.
-
-    Each dict contains:
-        name, subject, issuer, expiration_string, expiration_date,
-        days_until_expiry, subject_alternative_name, key_type,
-        serial_number, sha1_fingerprint
     """
+    from datetime import timezone
+
     certs = []
     current = None
 
@@ -183,47 +180,91 @@ def _parse_ssl_certs(raw_output):
                 certs.append(current)
             name = re.sub(r"\s*\{.*", "", re.sub(r"^sys (crypto cert|file ssl-cert)\s+", "", stripped)).strip()
             current = {
-                "name": name,
-                "subject": "",
-                "issuer": "",
-                "expiration_string": "",
-                "expiration_date": "",
-                "days_until_expiry": "",
-                "subject_alternative_name": "",
-                "key_type": "",
-                "serial_number": "",
-                "sha1_fingerprint": "",
+                "name":                    name,
+                "common_name":             "",
+                "subject":                 "",
+                "issuer":                  "",
+                "issuer_cert":             "",
+                "organization":            "",
+                "ou":                      "",
+                "country":                 "",
+                "state":                   "",
+                "city":                    "",
+                "email":                   "",
+                "subject_alternative_name":"",
+                "key_type":                "",
+                "key_size":                "",
+                "serial_number":           "",
+                "sha1_fingerprint":        "",
+                "fingerprint":             "",
+                "validity_start_string":   "",
+                "validity_start_date":     "",
+                "expiration_string":       "",
+                "expiration_date":         "",
+                "days_until_expiry":       "",
+                "cert_validators":         "",
+                "cache_path":              "",
             }
             continue
 
         if current is None:
             continue
 
-        if stripped.startswith("subject "):
-            current["subject"] = stripped.split("subject ", 1)[1].strip().strip('"')
+        def _val(prefix):
+            return stripped.split(prefix, 1)[1].strip().strip('"')
+
+        if stripped.startswith("common-name "):
+            current["common_name"] = _val("common-name ")
+        elif stripped.startswith("subject "):
+            current["subject"] = _val("subject ")
         elif stripped.startswith("issuer "):
-            current["issuer"] = stripped.split("issuer ", 1)[1].strip().strip('"')
+            current["issuer"] = _val("issuer ")
+        elif stripped.startswith("issuer-cert "):
+            current["issuer_cert"] = _val("issuer-cert ")
+        elif stripped.startswith("organization "):
+            current["organization"] = _val("organization ")
+        elif re.match(r"^ou\s+", stripped):
+            current["ou"] = _val("ou ")
+        elif stripped.startswith("country "):
+            current["country"] = _val("country ")
+        elif stripped.startswith("state "):
+            current["state"] = _val("state ")
+        elif stripped.startswith("city "):
+            current["city"] = _val("city ")
+        elif stripped.startswith("email "):
+            current["email"] = _val("email ")
+        elif stripped.startswith("subject-alternative-name "):
+            san = _val("subject-alternative-name ")
+            current["subject_alternative_name"] = "" if san == "none" else san
+        elif stripped.startswith("key-type "):
+            current["key_type"] = _val("key-type ")
+        elif stripped.startswith("key-size "):
+            current["key_size"] = _val("key-size ")
+        elif stripped.startswith("serial-number "):
+            current["serial_number"] = _val("serial-number ")
+        elif stripped.startswith("sha1-fingerprint "):
+            current["sha1_fingerprint"] = _val("sha1-fingerprint ")
+        elif stripped.startswith("fingerprint "):
+            current["fingerprint"] = _val("fingerprint ")
+        elif stripped.startswith("validity-start-string "):
+            current["validity_start_string"] = _val("validity-start-string ")
+        elif stripped.startswith("validity-start-date "):
+            current["validity_start_date"] = _val("validity-start-date ")
         elif stripped.startswith("expiration-string "):
-            current["expiration_string"] = stripped.split("expiration-string ", 1)[1].strip().strip('"')
+            current["expiration_string"] = _val("expiration-string ")
         elif stripped.startswith("expiration-date "):
-            ts = stripped.split("expiration-date ", 1)[1].strip()
+            ts = _val("expiration-date ")
             current["expiration_date"] = ts
             try:
-                from datetime import timezone
                 exp_dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
                 now_dt = datetime.now(tz=timezone.utc)
                 current["days_until_expiry"] = (exp_dt - now_dt).days
             except Exception:
                 pass
-        elif stripped.startswith("subject-alternative-name "):
-            san = stripped.split("subject-alternative-name ", 1)[1].strip()
-            current["subject_alternative_name"] = "" if san == "none" else san
-        elif stripped.startswith("key-type "):
-            current["key_type"] = stripped.split("key-type ", 1)[1].strip()
-        elif stripped.startswith("serial-number "):
-            current["serial_number"] = stripped.split("serial-number ", 1)[1].strip()
-        elif stripped.startswith("sha1-fingerprint "):
-            current["sha1_fingerprint"] = stripped.split("sha1-fingerprint ", 1)[1].strip()
+        elif stripped.startswith("cert-validators "):
+            current["cert_validators"] = _val("cert-validators ")
+        elif stripped.startswith("cache-path "):
+            current["cache_path"] = _val("cache-path ")
 
     if current is not None:
         certs.append(current)
@@ -471,14 +512,29 @@ def _write_certs_csv(results, output_path):
         "host",
         "timestamp",
         "cert_name",
+        "common_name",
         "subject",
         "issuer",
-        "expiration_string",
-        "days_until_expiry",
+        "issuer_cert",
+        "organization",
+        "ou",
+        "country",
+        "state",
+        "city",
+        "email",
         "subject_alternative_name",
         "key_type",
+        "key_size",
         "serial_number",
         "sha1_fingerprint",
+        "fingerprint",
+        "validity_start_string",
+        "validity_start_date",
+        "expiration_string",
+        "expiration_date",
+        "days_until_expiry",
+        "cert_validators",
+        "cache_path",
         "error",
     ]
     with open(output_path, "w", newline="") as fh:
@@ -496,18 +552,33 @@ def _write_certs_csv(results, output_path):
             else:
                 for c in r["ssl_certs"]:
                     writer.writerow({
-                        "host": r["host"],
-                        "timestamp": r["timestamp"],
-                        "cert_name": c["name"],
-                        "subject": c["subject"],
-                        "issuer": c["issuer"],
-                        "expiration_string": c["expiration_string"],
-                        "days_until_expiry": c["days_until_expiry"],
+                        "host":                     r["host"],
+                        "timestamp":                r["timestamp"],
+                        "cert_name":                c["name"],
+                        "common_name":              c["common_name"],
+                        "subject":                  c["subject"],
+                        "issuer":                   c["issuer"],
+                        "issuer_cert":              c["issuer_cert"],
+                        "organization":             c["organization"],
+                        "ou":                       c["ou"],
+                        "country":                  c["country"],
+                        "state":                    c["state"],
+                        "city":                     c["city"],
+                        "email":                    c["email"],
                         "subject_alternative_name": c["subject_alternative_name"],
-                        "key_type": c["key_type"],
-                        "serial_number": c["serial_number"],
-                        "sha1_fingerprint": c["sha1_fingerprint"],
-                        "error": "",
+                        "key_type":                 c["key_type"],
+                        "key_size":                 c["key_size"],
+                        "serial_number":            c["serial_number"],
+                        "sha1_fingerprint":         c["sha1_fingerprint"],
+                        "fingerprint":              c["fingerprint"],
+                        "validity_start_string":    c["validity_start_string"],
+                        "validity_start_date":      c["validity_start_date"],
+                        "expiration_string":        c["expiration_string"],
+                        "expiration_date":          c["expiration_date"],
+                        "days_until_expiry":        c["days_until_expiry"],
+                        "cert_validators":          c["cert_validators"],
+                        "cache_path":               c["cache_path"],
+                        "error":                    "",
                     })
     print(f"SSL cert results written to: {output_path}")
 
