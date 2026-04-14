@@ -102,7 +102,7 @@ def _open_channel(jump_client, target_host, target_port):
 
 def _parse_virtual_servers(raw_output):
     """
-    Parse `tmsh list ltm virtual` output into a list of dicts.
+    Parse `list ltm virtual` output into a list of dicts.
 
     Each dict contains:
         name, destination, ip, port, pool, ip_protocol, state, enabled
@@ -165,7 +165,7 @@ def _parse_virtual_servers(raw_output):
 
 def _parse_ssl_certs(raw_output):
     """
-    Parse `tmsh list sys crypto cert` output into a list of dicts.
+    Parse `list sys file ssl-cert all-properties` output into a list of dicts.
 
     Each dict contains:
         name, subject, issuer, expiration_string, expiration_date,
@@ -301,20 +301,20 @@ def collect_virtual_servers(host, username, password, jump_config):
         }
 
         net_connect = ConnectHandler(**device_params)
-        print(f"[{host}] Connected to F5 LTM — running 'tmsh list ltm virtual'...")
+        print(f"[{host}] Connected to F5 LTM — running 'list ltm virtual'...")
 
         # 4. Collect virtual servers
         raw = net_connect.send_command(
-            "tmsh list ltm virtual",
+            "list ltm virtual",
             read_timeout=COMMAND_TIMEOUT,
         )
         result["raw_output"] = raw
         result["virtual_servers"] = _parse_virtual_servers(raw)
 
         # 5. Collect SSL certificates
-        print(f"[{host}] Running 'tmsh list sys crypto cert'...")
+        print(f"[{host}] Running 'list sys file ssl-cert all-properties'...")
         raw_certs = net_connect.send_command(
-            "tmsh list sys crypto cert",
+            "list sys file ssl-cert all-properties",
             read_timeout=COMMAND_TIMEOUT,
         )
         result["raw_certs_output"] = raw_certs
