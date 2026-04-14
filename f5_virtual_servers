@@ -533,19 +533,14 @@ def _parse_args():
         help="Path to inventory file (default: inventory.txt)",
     )
     parser.add_argument(
-        "--output", "-o",
-        default="",
-        help="Output CSV file path (default: f5_vs_<timestamp>.csv)",
+        "--output-dir", "-o",
+        default="raw",
+        help="Base output directory (default: raw). Per-host subfolders are created automatically.",
     )
     parser.add_argument(
         "--json-output", "-j",
         default="",
-        help="Also write full JSON output to this path",
-    )
-    parser.add_argument(
-        "--cert-output", "-c",
-        default="",
-        help="Output CSV file path for SSL certs (default: f5_certs_<timestamp>.csv)",
+        help="Also write full combined JSON output to this path",
     )
     parser.add_argument(
         "--threads", "-t",
@@ -605,9 +600,8 @@ def main():
     }
 
     # ---- Output paths -----------------------------------------------------
-    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv   = args.output      or f"f5_vs_{ts_str}.csv"
-    output_certs = args.cert_output or f"f5_certs_{ts_str}.csv"
+    ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = args.output_dir
 
     # ---- Multithreaded collection -----------------------------------------
     results = []
@@ -647,8 +641,14 @@ def main():
 
     # ---- Output -----------------------------------------------------------
     _print_results(results)
-    _write_csv(results, output_csv)
-    _write_certs_csv(results, output_certs)
+
+    # Write per-host files into raw/<hostname>/
+    print()
+    for r in results:
+        host_dir = os.path.join(base_dir, r["host"])
+        os.makedirs(host_dir, exist_ok=True)
+        _write_csv([r],       os.path.join(host_dir, f"virtual_servers_{ts_str}.csv"))
+        _write_certs_csv([r], os.path.join(host_dir, f"ssl_certs_{ts_str}.csv"))
 
     if args.json_output:
         _write_json(results, args.json_output)
